@@ -368,9 +368,10 @@ Set:
 - a rollout `maxUnavailable` compatible with the PDB and remaining socket capacity
 - load-balancer deregistration or endpoint propagation time inside the drain budget
 
-On SIGTERM, Sockudo keeps its listener open for `SHUTDOWN_GRACE_PERIOD` seconds while `/ready`
-returns 503 `DRAINING` and new WebSocket upgrades are rejected, then closes existing connections
-with code 4200 and exits. Set `SHUTDOWN_GRACE_PERIOD` above the readiness probe's
+On SIGTERM, Sockudo rejects new WebSocket upgrades, closes existing connections immediately
+with code 4200 so clients reconnect right away, and keeps the listener open for
+`SHUTDOWN_GRACE_PERIOD` seconds while `/ready` returns 503 `DRAINING`. Set
+`SHUTDOWN_GRACE_PERIOD` above the readiness probe's
 `periodSeconds × failureThreshold` plus endpoint propagation time, and keep
 `terminationGracePeriodSeconds` above `SHUTDOWN_GRACE_PERIOD` plus the time needed to close
 connections.
