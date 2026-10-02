@@ -925,7 +925,7 @@ impl StatsAggregator {
 
     pub(crate) fn connection_closed(&self, app_id: &str) {
         if let Some(current) = self.connections.get(app_id) {
-            let _ = current.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            let _ = current.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(value.saturating_sub(1))
             });
         }
@@ -942,7 +942,7 @@ impl StatsAggregator {
 
     pub(crate) fn channel_closed(&self, app_id: &str) {
         if let Some(current) = self.channels.get(app_id) {
-            let _ = current.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            let _ = current.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 Some(value.saturating_sub(1))
             });
         }
