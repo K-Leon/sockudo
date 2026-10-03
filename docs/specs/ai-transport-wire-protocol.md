@@ -150,6 +150,14 @@ AI metadata is a convention over the existing `extras` field:
 
 `extras.ai.transport` and `extras.ai.codec` are string-to-string maps. Per tier: at most 32 keys and keys at most 64 bytes. Transport keys match `[a-z0-9-]+`; codec keys match `[A-Za-z0-9_-]+` for Ably/Vercel codec fields such as `providerMetadata`. Transport values and ordinary codec values are limited to 256 bytes of valid UTF-8; `extras.ai.codec.providerMetadata` is limited to 8 KiB. Unknown transport keys are rejected. Codec keys are not semantically interpreted but still obey tier limits.
 
+Additional keys directly under `extras.ai` are preserved as opaque JSON metadata,
+including Ably AI Transport 0.9's `type`, `fields`, `stream`, and `ends`. They
+remain subject to the enclosing message size limit and cannot shadow the typed
+`transport` or `codec` tiers. JSON, MessagePack, and Protobuf projections retain
+this metadata; Protobuf uses additive AI-extras field 3, containing a map of keys
+to JSON-encoded values. Empty metadata leaves the existing wire shape unchanged.
+Protocol V1 delivery continues to strip the entire extras envelope.
+
 Transport keys:
 
 | Key | Domain |

@@ -335,7 +335,7 @@ impl PresenceRegistry {
                 return Ok(());
             }
 
-            let reservation = self.reserved_capacity.fetch_update(
+            let reservation = self.reserved_capacity.try_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |reserved| {

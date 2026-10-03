@@ -379,6 +379,7 @@ async fn append_message_persists_terminal_status_in_latest_record() {
 
     let extras = MessageExtras {
         ai: Some(sockudo_protocol::messages::AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 "status".to_string(),
                 "complete".to_string(),
@@ -443,6 +444,7 @@ async fn events_rejects_ai_create_when_open_stream_cap_is_reached() {
     let app = test_app();
     let streaming_extras = || MessageExtras {
         ai: Some(sockudo_protocol::messages::AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 "status".to_string(),
                 "streaming".to_string(),

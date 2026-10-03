@@ -380,7 +380,7 @@ impl AblyOutboundReceiver {
 
 fn reserve(counter: &AtomicUsize, limit: usize) -> bool {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < limit).then_some(current + 1)
         })
         .is_ok()
@@ -388,7 +388,7 @@ fn reserve(counter: &AtomicUsize, limit: usize) -> bool {
 
 fn reserve_bytes(counter: &AtomicUsize, limit: usize, size: usize) -> bool {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current.checked_add(size).is_some_and(|next| next <= limit)).then_some(current + size)
         })
         .is_ok()

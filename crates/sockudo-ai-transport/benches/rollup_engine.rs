@@ -26,6 +26,7 @@ fn append(serial: &str, data: &str, version: i64, terminal: bool) -> PusherMessa
         idempotency_key: None,
         extras: Some(MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: Some(HashMap::from([("status".to_string(), status.to_string())])),
                 codec: None,
             }),

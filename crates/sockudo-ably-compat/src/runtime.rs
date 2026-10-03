@@ -564,7 +564,139 @@ struct AblySubscriberKey {
     requested_channel: Arc<str>,
 }
 
+/// Bounded base index, shared by ordinary attachments or owned by an attachment
+/// with a distinct delivery history. Eviction falls back to a full update.
+#[derive(Default)]
+struct AblyKnownMessages {
+    serials: HashMap<Arc<str>, u64>,
+    order: VecDeque<Arc<str>>,
+    sequence: u64,
+}
+
+impl AblyKnownMessages {
+    fn contains(&self, serial: &str) -> bool {
+        self.serials.contains_key(serial)
+    }
+
+    fn forget(&mut self, protocol: &AblyProtocolMessage) {
+        for message in protocol.messages.iter().flatten() {
+            if let Some(serial) = message.serial.as_deref() {
+                self.serials.remove(serial);
+            }
+        }
+    }
+
+    fn observe(&mut self, protocol: &AblyProtocolMessage, filter: Option<&AblyMessageFilter>) {
+        self.sequence = self.sequence.saturating_add(1);
+        for message in protocol.messages.iter().flatten() {
+            let Some(serial) = message.serial.as_deref() else {
+                continue;
+            };
+            if let Some(filter) = filter {
+                match filter.matches(message) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.serials.remove(serial);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(protocol = "ably", error = %error, "derived-channel filter evaluation failed");
+                        self.serials.remove(serial);
+                        continue;
+                    }
+                }
+            }
+            if message.action == Some(MESSAGE_SUMMARY) {
+                continue;
+            }
+            if let Some(sequence) = self.serials.get_mut(serial) {
+                *sequence = self.sequence;
+                continue;
+            }
+            if self.order.len() >= ABLY_COMPAT_MAX_REPLAY_MESSAGES
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.serials.remove(&oldest);
+            }
+            let serial: Arc<str> = Arc::from(serial);
+            self.serials.insert(Arc::clone(&serial), self.sequence);
+            self.order.push_back(serial);
+        }
+    }
+}
+
+/// Ordinary attachments share the channel's bounded base index. Only an
+/// attachment with a different delivery history needs its own copy.
+/// A shared base is known when its last observation is newer than the attach
+/// cutoff. A skipped mutation snapshots that history before invalidating it.
+enum AblySubscriberKnowledge {
+    Shared { since: u64 },
+    Individual(Box<AblyKnownMessages>),
+}
+
+impl AblySubscriberKnowledge {
+    fn new(since: u64, filtered: bool) -> Self {
+        if filtered {
+            Self::Individual(Box::default())
+        } else {
+            Self::Shared { since }
+        }
+    }
+
+    fn knows(&self, protocol: &AblyProtocolMessage, shared_sequence: Option<u64>) -> bool {
+        match self {
+            Self::Shared { since } => shared_sequence.is_some_and(|sequence| sequence > *since),
+            Self::Individual(known) => protocol.messages.iter().flatten().all(|message| {
+                message
+                    .serial
+                    .as_deref()
+                    .is_some_and(|serial| known.contains(serial))
+            }),
+        }
+    }
+
+    fn forget(&mut self, protocol: &AblyProtocolMessage, shared: &AblyKnownMessages) {
+        if !protocol
+            .messages
+            .iter()
+            .flatten()
+            .any(|message| message.serial.is_some())
+        {
+            return;
+        }
+        if let Self::Shared { since } = self {
+            let serials: HashMap<_, _> = shared
+                .serials
+                .iter()
+                .filter(|(_, sequence)| **sequence > *since)
+                .map(|(serial, sequence)| (Arc::clone(serial), *sequence))
+                .collect();
+            let order = shared
+                .order
+                .iter()
+                .filter(|serial| serials.contains_key(*serial))
+                .cloned()
+                .collect();
+            *self = Self::Individual(Box::new(AblyKnownMessages {
+                serials,
+                order,
+                sequence: shared.sequence,
+            }));
+        }
+        if let Self::Individual(known) = self {
+            known.forget(protocol);
+        }
+    }
+
+    fn observe(&mut self, protocol: &AblyProtocolMessage, filter: Option<&AblyMessageFilter>) {
+        if let Self::Individual(known) = self {
+            known.observe(protocol, filter);
+        }
+    }
+}
+
 struct AblySubscriber {
+    known_messages: AblySubscriberKnowledge,
     connection_id: Arc<str>,
     sender: AblySender,
     filter: Option<Arc<AblyMessageFilter>>,
@@ -579,6 +711,7 @@ struct AblySubscriber {
 }
 
 struct AblyDeliverySubscriber {
+    append_aggregate: bool,
     sender: AblySender,
     filter: Option<Arc<AblyMessageFilter>>,
     #[cfg(feature = "delta")]
@@ -590,6 +723,7 @@ struct AblyDeliverySubscriber {
 impl AblySubscriber {
     fn delivery_snapshot(&self, shared_recovery: bool) -> AblyDeliverySubscriber {
         AblyDeliverySubscriber {
+            append_aggregate: false,
             sender: Arc::clone(&self.sender),
             filter: self.filter.clone(),
             #[cfg(feature = "delta")]
@@ -679,9 +813,12 @@ fn push_bounded_recovery_message(gate: &mut AblyAttachGate, message: AblyProtoco
 
 fn push_bounded_recovery_message_with_size(
     gate: &mut AblyAttachGate,
-    message: AblyProtocolMessage,
+    mut message: AblyProtocolMessage,
     message_bytes: usize,
 ) {
+    if !retain_recoverable_messages(&mut message) {
+        return;
+    }
     if gate.overflowed
         || gate.messages.len() >= ABLY_ATTACH_GATE_MAX_MESSAGES
         || gate.bytes.saturating_add(message_bytes) > ABLY_ATTACH_GATE_MAX_BYTES
@@ -693,6 +830,21 @@ fn push_bounded_recovery_message_with_size(
     }
     gate.bytes = gate.bytes.saturating_add(message_bytes);
     gate.messages.push(message);
+}
+
+fn retain_recoverable_messages(message: &mut AblyProtocolMessage) -> bool {
+    let Some(messages) = message.messages.as_mut() else {
+        return true;
+    };
+    messages.retain(|message| {
+        message
+            .extras
+            .as_ref()
+            .and_then(|extras| extras.get("ephemeral"))
+            .and_then(Value::as_bool)
+            != Some(true)
+    });
+    !messages.is_empty()
 }
 
 #[derive(Clone)]
@@ -725,11 +877,14 @@ impl Default for AblyRecoveryTail {
 impl AblyRecoveryTail {
     fn push_with_size(
         &mut self,
-        message: AblyProtocolMessage,
+        mut message: AblyProtocolMessage,
         publisher_connection_id: Option<&str>,
         echo_override: Option<bool>,
         message_bytes: usize,
     ) {
+        if !retain_recoverable_messages(&mut message) {
+            return;
+        }
         self.sequence = self.sequence.saturating_add(1);
         if message_bytes > ABLY_ATTACH_GATE_MAX_BYTES {
             self.messages.clear();
@@ -1008,6 +1163,7 @@ struct AblyRecoveryFailure {
 
 #[derive(Default)]
 struct AblyChannelState {
+    known_messages: AblyKnownMessages,
     subscribers: HashMap<AblySubscriberKey, AblySubscriber>,
     recovery_gates: HashMap<AblySubscriberKey, AblyAttachGate>,
     recovery_tail: AblyRecoveryTail,
@@ -1398,9 +1554,11 @@ impl AblyCompatRuntime {
         let state = self.hub.channel_state("benchmark-app", channel);
         let mut state = lock_channel_state(&state);
         let recovery_tail_start = state.recovery_tail.sequence;
+        let known_since = state.known_messages.sequence;
         state.subscribers.insert(
             subscriber_key(session_id, channel),
             AblySubscriber {
+                known_messages: AblySubscriberKnowledge::new(known_since, false),
                 connection_id: Arc::from(session_id),
                 sender,
                 filter: None,
@@ -1797,7 +1955,7 @@ impl RealtimeEgressTap for AblyCompatHub {
             );
             return Ok(());
         }
-        let mut channel_serial = envelope
+        let channel_serial = envelope
             .stream_id
             .as_deref()
             .zip(envelope.delivery_serial)
@@ -1874,46 +2032,39 @@ impl RealtimeEgressTap for AblyCompatHub {
                     return Ok(());
                 }
             };
-        let is_append =
-            envelope.action == Some(sockudo_core::versioned_messages::MessageAction::Append);
-        let primary_channel_serial = if is_append {
-            channel_serial.clone()
+        let aggregate = if envelope.action
+            == Some(sockudo_core::versioned_messages::MessageAction::Append)
+        {
+            match envelope_to_ably_message(envelope, message, AblyMessageProjection::Aggregate) {
+                Ok(message) => Some(message),
+                Err(error) => {
+                    warn!(protocol = "ably", app_id, channel, error = %error, "append aggregate projection failed");
+                    return Ok(());
+                }
+            }
         } else {
-            channel_serial.take()
+            None
         };
-        self.broadcast(
+        let protocol = AblyProtocolMessage {
+            action: ACTION_MESSAGE,
+            timestamp: Some(now_ms()),
+            channel: Some(channel.to_string()),
+            channel_serial,
+            messages: Some(vec![ably_message]),
+            ..empty_protocol_message(ACTION_MESSAGE)
+        };
+        let aggregate = aggregate.map(|message| AblyProtocolMessage {
+            messages: Some(vec![message]),
+            ..protocol.clone()
+        });
+        self.broadcast_with_append_projection(
             app_id,
             channel,
-            AblyProtocolMessage {
-                action: ACTION_MESSAGE,
-                timestamp: Some(now_ms()),
-                channel: Some(channel.to_string()),
-                channel_serial: primary_channel_serial,
-                messages: Some(vec![ably_message]),
-                ..empty_protocol_message(ACTION_MESSAGE)
-            },
+            protocol,
+            aggregate,
             envelope.publisher_connection_id.as_deref(),
             envelope.extras.as_ref().and_then(|extras| extras.echo),
         );
-        if is_append
-            && let Ok(aggregate) =
-                envelope_to_ably_message(envelope, message, AblyMessageProjection::Aggregate)
-        {
-            self.broadcast(
-                app_id,
-                channel,
-                AblyProtocolMessage {
-                    action: ACTION_MESSAGE,
-                    timestamp: Some(now_ms()),
-                    channel: Some(channel.to_string()),
-                    channel_serial,
-                    messages: Some(vec![aggregate]),
-                    ..empty_protocol_message(ACTION_MESSAGE)
-                },
-                envelope.publisher_connection_id.as_deref(),
-                envelope.extras.as_ref().and_then(|extras| extras.echo),
-            );
-        }
         Ok(())
     }
 
@@ -2799,9 +2950,14 @@ impl AblyCompatHub {
             let mut state = lock_channel_state(&state);
             let activated = state.subscribers.is_empty();
             let recovery_tail_start = state.recovery_tail.sequence;
+            let known_since = state.known_messages.sequence;
             state.subscribers.insert(
                 subscriber_key(attachment.session_id, channel.requested()),
                 AblySubscriber {
+                    known_messages: AblySubscriberKnowledge::new(
+                        known_since,
+                        attachment.filter.is_some(),
+                    ),
                     connection_id: Arc::from(attachment.connection_id),
                     sender: attachment.sender.clone(),
                     filter: attachment.filter.clone(),
@@ -2843,11 +2999,13 @@ impl AblyCompatHub {
         channel: &AblyChannelName,
         session_id: &str,
         high_water: Option<&AblyChannelPosition>,
+        replay: &[AblyProtocolMessage],
     ) -> Result<Vec<AblyProtocolMessage>, AblyRecoveryFailure> {
         let state = self.channel_state(app_id, channel.base());
         let mut state = lock_channel_state(&state);
         let key = subscriber_key(session_id, channel.requested());
         let recovery_tail_start = state.recovery_tail.sequence;
+        let known_since = state.known_messages.sequence;
         let gate = state
             .subscribers
             .get_mut(&key)
@@ -2894,6 +3052,18 @@ impl AblyCompatHub {
             }
             messages.push(message);
         }
+        if let Some(subscriber) = state.subscribers.get_mut(&key) {
+            subscriber.known_messages = if replay.is_empty() && messages.is_empty() {
+                AblySubscriberKnowledge::new(known_since, subscriber.filter.is_some())
+            } else {
+                AblySubscriberKnowledge::Individual(Box::default())
+            };
+            for message in replay.iter().chain(&messages) {
+                subscriber
+                    .known_messages
+                    .observe(message, subscriber.filter.as_deref());
+            }
+        }
         Ok(messages)
     }
 
@@ -2928,10 +3098,15 @@ impl AblyCompatHub {
         let state = self.channel_state(app_id, channel.base());
         let mut state = lock_channel_state(&state);
         let recovery_tail_start = state.recovery_tail.sequence;
+        let known_since = state.known_messages.sequence;
         state
             .subscribers
             .entry(subscriber_key(attachment.session_id, channel.requested()))
             .or_insert_with(|| AblySubscriber {
+                known_messages: AblySubscriberKnowledge::new(
+                    known_since,
+                    attachment.filter.is_some(),
+                ),
                 connection_id: Arc::from(attachment.connection_id),
                 sender: attachment.sender.clone(),
                 filter: attachment.filter.clone(),
@@ -2961,6 +3136,7 @@ impl AblyCompatHub {
             channel,
             attachment.session_id,
             high_water.as_ref(),
+            &replay,
         ) {
             Ok(buffered) => buffered,
             Err(failure) => {
@@ -3198,6 +3374,25 @@ impl AblyCompatHub {
         publisher_connection_id: Option<&str>,
         echo_override: Option<bool>,
     ) {
+        self.broadcast_with_append_projection(
+            app_id,
+            channel,
+            message,
+            None,
+            publisher_connection_id,
+            echo_override,
+        );
+    }
+
+    fn broadcast_with_append_projection(
+        &self,
+        app_id: &str,
+        channel: &str,
+        message: AblyProtocolMessage,
+        aggregate: Option<AblyProtocolMessage>,
+        publisher_connection_id: Option<&str>,
+        echo_override: Option<bool>,
+    ) {
         let now = now_ms();
         let mut delivered_messages = 0u64;
         let mut delivered_bytes = 0u64;
@@ -3236,12 +3431,38 @@ impl AblyCompatHub {
                 .values()
                 .any(|subscriber| subscriber.attach_gate.is_some())
                 .then(|| {
-                    sonic_rs::to_vec(&message)
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(ABLY_ATTACH_GATE_MAX_BYTES.saturating_add(1))
+                    [&message]
+                        .into_iter()
+                        .chain(aggregate.as_ref())
+                        .map(|projection| {
+                            sonic_rs::to_vec(projection)
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(ABLY_ATTACH_GATE_MAX_BYTES.saturating_add(1))
+                        })
+                        .max()
+                        .unwrap_or_default()
                 });
             let mut ready = Vec::new();
-            for (key, subscriber) in state.subscribers.iter_mut() {
+            let shared_sequence = aggregate.as_ref().and_then(|_| {
+                message
+                    .messages
+                    .iter()
+                    .flatten()
+                    .map(|message| {
+                        message
+                            .serial
+                            .as_deref()
+                            .and_then(|serial| state.known_messages.serials.get(serial).copied())
+                            .unwrap_or(0)
+                    })
+                    .min()
+            });
+            let AblyChannelState {
+                subscribers,
+                known_messages,
+                ..
+            } = &mut *state;
+            for (key, subscriber) in subscribers.iter_mut() {
                 if !should_deliver_to_subscriber(
                     publisher_connection_id,
                     subscriber.connection_id.as_ref(),
@@ -3249,8 +3470,20 @@ impl AblyCompatHub {
                     echo_override,
                 ) || required_mode.is_some_and(|mode| subscriber.mode_flags & mode == 0)
                 {
+                    subscriber.known_messages.forget(&message, known_messages);
                     continue;
                 }
+                let append_aggregate = aggregate.is_some()
+                    && (subscriber.attach_gate.is_some()
+                        || !subscriber.known_messages.knows(&message, shared_sequence));
+                let selected = if append_aggregate {
+                    aggregate.as_ref().unwrap_or(&message)
+                } else {
+                    &message
+                };
+                subscriber
+                    .known_messages
+                    .observe(selected, subscriber.filter.as_deref());
                 if let Some(gate) = subscriber.attach_gate.as_mut() {
                     let message_bytes = message_bytes.unwrap_or_default();
                     if gate.overflowed
@@ -3262,19 +3495,23 @@ impl AblyCompatHub {
                         gate.bytes = 0;
                     } else {
                         gate.bytes = gate.bytes.saturating_add(message_bytes);
-                        gate.messages.push(message.clone());
+                        gate.messages.push(selected.clone());
                     }
                 } else {
-                    let shared_recovery = subscriber.direct_recovery_gate.messages.is_empty()
+                    let shared_recovery = !append_aggregate
+                        && subscriber.direct_recovery_gate.messages.is_empty()
                         && !subscriber.direct_recovery_gate.overflowed
                         && subscriber_uses_shared_recovery(key, subscriber, channel);
-                    ready.push((key.clone(), subscriber.delivery_snapshot(shared_recovery)));
+                    let mut snapshot = subscriber.delivery_snapshot(shared_recovery);
+                    snapshot.append_aggregate = append_aggregate;
+                    ready.push((key.clone(), snapshot));
                 }
             }
+            known_messages.observe(&message, None);
             ready
         };
 
-        if subscribers.len() == 1 {
+        if aggregate.is_none() && subscribers.len() == 1 {
             let (subscriber_key, subscriber) = &subscribers[0];
             let plain_single_subscriber = subscriber_key.requested_channel.as_ref() == channel
                 && subscriber.filter.is_none()
@@ -3343,7 +3580,7 @@ impl AblyCompatHub {
         let mut stale = Vec::new();
         #[cfg(feature = "delta")]
         let mut delta_groups = HashMap::<
-            (AblyFormat, Arc<str>, Option<Arc<str>>),
+            (AblyFormat, Arc<str>, Option<Arc<str>>, bool),
             Vec<(AblySubscriberKey, AblyDeliverySubscriber)>,
         >::new();
         #[cfg(feature = "delta")]
@@ -3363,12 +3600,18 @@ impl AblyCompatHub {
                     subscriber.sender.format(),
                     key.requested_channel.clone(),
                     base_id,
+                    subscriber.append_aggregate,
                 ))
                 .or_default()
                 .push((key, subscriber));
         }
         #[cfg(feature = "delta")]
-        for ((format, requested_channel, _), subscribers) in delta_groups {
+        for ((format, requested_channel, _, append_aggregate), subscribers) in delta_groups {
+            let message = if append_aggregate {
+                aggregate.as_ref().unwrap_or(&message)
+            } else {
+                &message
+            };
             let mut projected = if requested_channel.as_ref() == channel
                 && message.channel.as_deref() == Some(channel)
             {
@@ -3433,19 +3676,28 @@ impl AblyCompatHub {
         }
 
         let mut grouped = HashMap::<
-            (AblyFormat, Arc<str>),
+            (AblyFormat, Arc<str>, bool),
             Vec<(AblySubscriberKey, AblyDeliverySubscriber)>,
         >::new();
         for (key, subscriber) in subscribers {
             grouped
-                .entry((subscriber.sender.format(), key.requested_channel.clone()))
+                .entry((
+                    subscriber.sender.format(),
+                    key.requested_channel.clone(),
+                    subscriber.append_aggregate,
+                ))
                 .or_default()
                 .push((key, subscriber));
         }
 
         #[cfg(not(feature = "delta"))]
         let mut stale = Vec::new();
-        for ((format, requested_channel), subscribers) in grouped {
+        for ((format, requested_channel, append_aggregate), subscribers) in grouped {
+            let message = if append_aggregate {
+                aggregate.as_ref().unwrap_or(&message)
+            } else {
+                &message
+            };
             let mut projected = if requested_channel.as_ref() == channel
                 && message.channel.as_deref() == Some(channel)
             {
@@ -3586,10 +3838,15 @@ impl AblyCompatHub {
         let state = self.channel_state(app_id, channel.base());
         let mut state = lock_channel_state(&state);
         let recovery_tail_start = state.recovery_tail.sequence;
+        let known_since = state.known_messages.sequence;
         state
             .subscribers
             .entry(subscriber_key(attachment.session_id, channel.requested()))
             .or_insert_with(|| AblySubscriber {
+                known_messages: AblySubscriberKnowledge::new(
+                    known_since,
+                    attachment.filter.is_some(),
+                ),
                 connection_id: Arc::from(attachment.connection_id),
                 sender: attachment.sender.clone(),
                 filter: attachment.filter.clone(),
@@ -3649,6 +3906,7 @@ impl AblyCompatHub {
             channel,
             attachment.session_id,
             Some(&high_water),
+            &replay,
         ) {
             Ok(buffered) => buffered,
             Err(failure) => {
@@ -3705,9 +3963,14 @@ impl AblyCompatHub {
         let state = self.channel_state(app_id, channel.base());
         let mut state = lock_channel_state(&state);
         let recovery_tail_start = state.recovery_tail.sequence;
+        let known_since = state.known_messages.sequence;
         state.subscribers.insert(
             subscriber_key(attachment.session_id, channel.requested()),
             AblySubscriber {
+                known_messages: AblySubscriberKnowledge::new(
+                    known_since,
+                    attachment.filter.is_some(),
+                ),
                 connection_id: Arc::from(attachment.connection_id),
                 sender: attachment.sender.clone(),
                 filter: attachment.filter.clone(),

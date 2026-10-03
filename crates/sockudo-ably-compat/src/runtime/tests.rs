@@ -152,10 +152,49 @@ fn publish_validation_rejects_reserved_and_unknown_fields() {
     assert!(validate_ably_publish_message(&reserved, true, AiHeaderLimits::default()).is_err());
 
     let unknown = AblyMessage {
-        extras: Some(json!({ "ephemeral": true })),
+        extras: Some(json!({ "unsupported": true })),
         ..AblyMessage::default()
     };
     assert!(validate_ably_publish_message(&unknown, false, AiHeaderLimits::default()).is_err());
+}
+
+#[test]
+fn publish_preserves_upstream_ai_codec_metadata() {
+    let extras = json!({
+        "ai": {
+            "type": "text-delta",
+            "fields": { "id": "m1", "nested": { "items": [1, true, null] } },
+            "stream": true,
+            "ends": "serial-1"
+        }
+    });
+    let decoded = ably_extras_to_message_extras(Some(extras.clone()))
+        .unwrap()
+        .unwrap();
+    decoded.validate_ai_headers().unwrap();
+    assert_eq!(ably_extras_from_message_extras(&decoded), Some(extras));
+}
+
+#[test]
+fn publish_accepts_and_projects_ephemeral_flag() {
+    for ephemeral in [true, false] {
+        let extras = json!({ "ephemeral": ephemeral });
+        let message = AblyMessage {
+            extras: Some(extras.clone()),
+            ..AblyMessage::default()
+        };
+        validate_ably_publish_message(&message, false, AiHeaderLimits::default()).unwrap();
+        let decoded = ably_extras_to_message_extras(message.extras)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.ephemeral, Some(ephemeral));
+        assert_eq!(ably_extras_from_message_extras(&decoded), Some(extras));
+    }
+    let invalid = AblyMessage {
+        extras: Some(json!({ "ephemeral": "true" })),
+        ..AblyMessage::default()
+    };
+    assert!(validate_ably_publish_message(&invalid, false, AiHeaderLimits::default()).is_err());
 }
 
 #[test]
@@ -2537,87 +2576,272 @@ async fn subscriber_mode_update_stops_delivery_after_auth_downgrade() {
 }
 
 #[tokio::test]
-async fn append_delivery_preserves_channel_serial_across_both_projections() {
-    let hub = AblyCompatHub::default();
-    let (sender, mut receiver) = AblyOutbound::channel(
-        AblyFormat::Json,
-        OutboundLimits::default(),
-        Arc::clone(&hub.metrics),
-    );
-    let channel = AblyChannelName::parse("append-room".to_string()).unwrap();
-    hub.attach_clean(
-        "app",
-        &channel,
-        AblyAttachment {
-            connection_id: "subscriber-connection",
-            session_id: "subscriber-session",
-            sender,
-            filter: None,
-            params: HashMap::new(),
-            mode_flags: ABLY_DEFAULT_MODE_FLAGS,
-            echo: true,
-            presence: Vec::new(),
-        },
-        None,
-        Vec::new(),
-        false,
-    );
-    let attached = receiver.recv().await.expect("ATTACHED frame");
-    assert_eq!(
-        decode_protocol_bytes(attached.bytes.as_ref(), AblyFormat::Json)
-            .unwrap()
-            .action,
-        ACTION_ATTACHED
-    );
+async fn append_delivery_selects_one_projection_and_preserves_channel_serial() {
+    for knows_message in [false, true] {
+        let hub = AblyCompatHub::default();
+        let (sender, mut receiver) = AblyOutbound::channel(
+            AblyFormat::Json,
+            OutboundLimits::default(),
+            Arc::clone(&hub.metrics),
+        );
+        let channel = AblyChannelName::parse("append-room".to_string()).unwrap();
+        hub.attach_clean(
+            "app",
+            &channel,
+            AblyAttachment {
+                connection_id: "subscriber-connection",
+                session_id: "subscriber-session",
+                sender,
+                filter: None,
+                params: HashMap::new(),
+                mode_flags: ABLY_DEFAULT_MODE_FLAGS,
+                echo: true,
+                presence: Vec::new(),
+            },
+            None,
+            Vec::new(),
+            false,
+        );
+        let attached = receiver.recv().await.expect("ATTACHED frame");
+        assert_eq!(
+            decode_protocol_bytes(attached.bytes.as_ref(), AblyFormat::Json)
+                .unwrap()
+                .action,
+            ACTION_ATTACHED
+        );
 
-    let message = PusherMessage {
-        event: Some("sockudo:message.append".to_string()),
-        channel: Some(channel.base().to_string()),
-        data: Some(MessageData::String("hello".to_string())),
-        name: Some("ai-output".to_string()),
-        user_id: None,
-        tags: None,
-        sequence: None,
-        conflation_key: None,
-        message_id: Some("message-1".to_string()),
-        stream_id: Some("stream-1".to_string()),
-        serial: Some(7),
-        idempotency_key: None,
-        extras: None,
-        delta_sequence: None,
-        delta_conflation_key: None,
+        let message = PusherMessage {
+            event: Some("sockudo:message.append".to_string()),
+            channel: Some(channel.base().to_string()),
+            data: Some(MessageData::String("hello".to_string())),
+            name: Some("ai-output".to_string()),
+            user_id: None,
+            tags: None,
+            sequence: None,
+            conflation_key: None,
+            message_id: Some("message-1".to_string()),
+            stream_id: Some("stream-1".to_string()),
+            serial: Some(7),
+            idempotency_key: None,
+            extras: None,
+            delta_sequence: None,
+            delta_conflation_key: None,
+        };
+        let mut envelope = MessageEnvelope::from_message(&message, None, None, 1).unwrap();
+        envelope.set_commit_positions(Some("stream-1".to_string()), Some(7), Some(7));
+        envelope.action = Some(MessageAction::Append);
+
+        if knows_message {
+            hub.broadcast(
+                "app",
+                channel.base(),
+                AblyProtocolMessage {
+                    messages: Some(vec![AblyMessage {
+                        serial: Some("7".to_string()),
+                        action: Some(MESSAGE_CREATE),
+                        ..AblyMessage::default()
+                    }]),
+                    ..empty_protocol_message(ACTION_MESSAGE)
+                },
+                None,
+                None,
+            );
+            receiver.recv().await.expect("original create");
+        }
+        RealtimeEgressTap::deliver(&hub, "app", channel.base(), &message, &envelope).unwrap();
+
+        let delivered = receiver.recv().await.expect("append delivery");
+        let delivered = decode_protocol_bytes(delivered.bytes.as_ref(), AblyFormat::Json).unwrap();
+        assert_eq!(delivered.channel_serial.as_deref(), Some("stream-1:7"));
+        assert_eq!(
+            delivered.messages.as_ref().unwrap()[0].action,
+            Some(if knows_message {
+                MESSAGE_APPEND
+            } else {
+                MESSAGE_UPDATE
+            })
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err(),
+            "one projection per subscriber"
+        );
+    }
+}
+
+#[test]
+fn ephemeral_messages_are_excluded_from_shared_and_direct_recovery() {
+    let ephemeral = AblyMessage {
+        serial: Some("transient".to_string()),
+        extras: Some(json!({ "ephemeral": true })),
+        ..AblyMessage::default()
     };
-    let mut envelope = MessageEnvelope::from_message(&message, None, None, 1).unwrap();
-    envelope.set_commit_positions(Some("stream-1".to_string()), Some(7), Some(7));
-    envelope.action = Some(MessageAction::Append);
+    let persistent = AblyMessage {
+        serial: Some("persistent".to_string()),
+        ..AblyMessage::default()
+    };
+    let mut tail = AblyRecoveryTail::default();
+    let mut gate = AblyAttachGate::default();
+    for messages in [vec![ephemeral.clone()], vec![ephemeral, persistent]] {
+        let protocol = AblyProtocolMessage {
+            messages: Some(messages),
+            ..empty_protocol_message(ACTION_MESSAGE)
+        };
+        tail.push_with_size(protocol.clone(), None, None, 128);
+        push_bounded_recovery_message_with_size(&mut gate, protocol, 128);
+    }
+    assert_eq!(tail.sequence, 1);
+    assert_eq!(tail.messages.len(), 1);
+    assert_eq!(gate.messages.len(), 1);
+    for protocol in [&tail.messages[0].message, &gate.messages[0]] {
+        let messages = protocol.messages.as_ref().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].serial.as_deref(), Some("persistent"));
+    }
+}
 
-    RealtimeEgressTap::deliver(&hub, "app", channel.base(), &message, &envelope).unwrap();
+#[test]
+fn append_base_tracking_is_bounded_and_forgets_filtered_mutations() {
+    let mut known = AblyKnownMessages::default();
+    let message = |serial: String, name: &str| AblyProtocolMessage {
+        messages: Some(vec![AblyMessage {
+            serial: Some(serial),
+            name: Some(name.to_string()),
+            action: Some(MESSAGE_CREATE),
+            ..AblyMessage::default()
+        }]),
+        ..empty_protocol_message(ACTION_MESSAGE)
+    };
+    for serial in 0..=ABLY_COMPAT_MAX_REPLAY_MESSAGES {
+        known.observe(&message(serial.to_string(), "match"), None);
+    }
+    assert!(!known.contains("0"));
+    assert_eq!(known.serials.len(), ABLY_COMPAT_MAX_REPLAY_MESSAGES);
+    assert_eq!(known.order.len(), ABLY_COMPAT_MAX_REPLAY_MESSAGES);
 
-    let mutation = receiver.recv().await.expect("append mutation");
-    let mutation = decode_protocol_bytes(mutation.bytes.as_ref(), AblyFormat::Json).unwrap();
-    let aggregate = receiver.recv().await.expect("append aggregate");
-    let aggregate = decode_protocol_bytes(aggregate.bytes.as_ref(), AblyFormat::Json).unwrap();
-    assert_eq!(mutation.channel_serial.as_deref(), Some("stream-1:7"));
-    assert_eq!(
-        aggregate.channel_serial.as_deref(),
-        mutation.channel_serial.as_deref()
-    );
-    assert_eq!(
-        mutation
-            .messages
-            .as_ref()
-            .and_then(|messages| messages.first())
-            .and_then(|message| message.action),
-        Some(MESSAGE_APPEND)
-    );
-    assert_eq!(
-        aggregate
-            .messages
-            .as_ref()
-            .and_then(|messages| messages.first())
-            .and_then(|message| message.action),
-        Some(MESSAGE_UPDATE)
-    );
+    let expression = general_purpose::STANDARD.encode("name == `\"match\"`");
+    let channel = AblyChannelName::parse(format!("[filter={expression}]room")).unwrap();
+    let filter = AblyMessageFilter::from_channel(&channel).unwrap().unwrap();
+    assert!(known.contains("1"));
+    known.observe(&message("1".to_string(), "miss"), Some(&filter));
+    assert!(!known.contains("1"));
+    known.observe(&message("1".to_string(), "match"), Some(&filter));
+    assert!(known.contains("1"));
+    known.forget(&message("1".to_string(), "match"));
+    assert!(!known.contains("1"));
+}
+
+#[tokio::test]
+async fn shared_append_bases_respect_late_join_replay_echo_and_mode_changes() {
+    for format in [AblyFormat::Json, AblyFormat::MsgPack] {
+        let hub = AblyCompatHub::default();
+        let channel = AblyChannelName::parse("shared-append-room".to_string()).unwrap();
+        let frame = |action| AblyProtocolMessage {
+            channel: Some(channel.base().to_string()),
+            messages: Some(vec![AblyMessage {
+                serial: Some("base".to_string()),
+                action: Some(action),
+                ..AblyMessage::default()
+            }]),
+            ..empty_protocol_message(ACTION_MESSAGE)
+        };
+        let attach = |session_id: &str, replay| {
+            let (sender, receiver) =
+                AblyOutbound::channel(format, OutboundLimits::default(), Arc::clone(&hub.metrics));
+            hub.attach_clean(
+                "app",
+                &channel,
+                AblyAttachment {
+                    connection_id: session_id,
+                    session_id,
+                    sender,
+                    filter: None,
+                    params: HashMap::new(),
+                    mode_flags: ABLY_DEFAULT_MODE_FLAGS,
+                    echo: true,
+                    presence: Vec::new(),
+                },
+                None,
+                replay,
+                false,
+            );
+            receiver
+        };
+        let assert_next = async |receiver: &mut crate::outbound::AblyOutboundReceiver, action| {
+            let delivered = receiver.recv().await.expect("expected delivery");
+            let delivered = decode_protocol_bytes(delivered.bytes.as_ref(), format).unwrap();
+            assert_eq!(delivered.messages.unwrap()[0].action, Some(action));
+        };
+        let append = |publisher, echo_override| {
+            hub.broadcast_with_append_projection(
+                "app",
+                channel.base(),
+                frame(MESSAGE_APPEND),
+                Some(frame(MESSAGE_UPDATE)),
+                publisher,
+                echo_override,
+            )
+        };
+
+        let mut early = attach("early", Vec::new());
+        early.recv().await.expect("ATTACHED");
+        hub.broadcast("app", channel.base(), frame(MESSAGE_CREATE), None, None);
+        assert_next(&mut early, MESSAGE_CREATE).await;
+
+        let mut late = attach("late", Vec::new());
+        late.recv().await.expect("ATTACHED");
+        let mut replayed = attach("replayed", vec![frame(MESSAGE_CREATE)]);
+        replayed.recv().await.expect("ATTACHED");
+        assert_next(&mut replayed, MESSAGE_CREATE).await;
+
+        append(None, None);
+        assert_next(&mut early, MESSAGE_APPEND).await;
+        assert_next(&mut late, MESSAGE_UPDATE).await;
+        assert_next(&mut replayed, MESSAGE_APPEND).await;
+
+        // Missing a mutation invalidates only that attachment's base.
+        for skip_echo in [true, false] {
+            if !skip_echo {
+                hub.update_subscriber_mode_flags("app", &channel, "early", ABLY_MODE_PUBLISH);
+            }
+            append(skip_echo.then_some("early"), skip_echo.then_some(false));
+            assert_next(&mut late, MESSAGE_APPEND).await;
+            assert_next(&mut replayed, MESSAGE_APPEND).await;
+            hub.update_subscriber_mode_flags("app", &channel, "early", ABLY_DEFAULT_MODE_FLAGS);
+            append(None, None);
+            assert_next(&mut early, MESSAGE_UPDATE).await;
+            assert_next(&mut late, MESSAGE_APPEND).await;
+            assert_next(&mut replayed, MESSAGE_APPEND).await;
+            append(None, None);
+            assert_next(&mut early, MESSAGE_APPEND).await;
+            assert_next(&mut late, MESSAGE_APPEND).await;
+            assert_next(&mut replayed, MESSAGE_APPEND).await;
+        }
+    }
+}
+
+#[test]
+fn individual_append_bases_only_copy_messages_seen_since_attachment() {
+    let frame = |serial: &str| AblyProtocolMessage {
+        messages: Some(vec![AblyMessage {
+            serial: Some(serial.to_string()),
+            action: Some(MESSAGE_CREATE),
+            ..AblyMessage::default()
+        }]),
+        ..empty_protocol_message(ACTION_MESSAGE)
+    };
+    let mut shared = AblyKnownMessages::default();
+    shared.observe(&frame("before-attach"), None);
+    let mut subscriber = AblySubscriberKnowledge::new(shared.sequence, false);
+    shared.observe(&frame("retained"), None);
+    shared.observe(&frame("missed"), None);
+    subscriber.forget(&frame("missed"), &shared);
+    assert!(!subscriber.knows(&frame("before-attach"), None));
+    assert!(subscriber.knows(&frame("retained"), None));
+    assert!(!subscriber.knows(&frame("missed"), None));
+    subscriber.observe(&frame("missed"), None);
+    assert!(subscriber.knows(&frame("missed"), None));
 }
 
 #[test]
@@ -3568,6 +3792,7 @@ fn pusher_to_ably_keeps_ai_extras_and_hides_runtime_headers() {
         idempotency_key: None,
         extras: Some(MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: Some(HashMap::from([(
                     "input-client-id".to_string(),
                     "client-1".to_string(),
@@ -3591,6 +3816,7 @@ fn pusher_to_ably_keeps_ai_extras_and_hides_runtime_headers() {
 fn stamp_ai_identity_rejects_client_id_spoofing() {
     let mut extras = Some(MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_INPUT_CLIENT_ID.to_string(),
                 "other-client".to_string(),
@@ -4770,6 +4996,7 @@ fn append_projection_uses_delta_for_mutations_and_aggregate_for_history() {
         idempotency_key: None,
         extras: Some(MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: None,
                 codec: Some(HashMap::from([(
                     "status".to_string(),

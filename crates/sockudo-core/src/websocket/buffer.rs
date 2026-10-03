@@ -152,7 +152,7 @@ impl ByteCounter {
     #[inline]
     pub fn try_reserve(&self, size: usize, limit: usize) -> bool {
         self.bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(size).filter(|next| *next <= limit)
             })
             .is_ok()
@@ -367,7 +367,7 @@ pub struct SizedMessageSenderHandle {
 
 fn try_reserve_message(pending: &AtomicUsize, limit: usize) -> bool {
     pending
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1).filter(|next| *next <= limit)
         })
         .is_ok()

@@ -66,7 +66,7 @@ pub fn deserialize_message(bytes: &[u8], format: WireFormat) -> Result<PusherMes
         WireFormat::Protobuf => {
             let proto = ProtoPusherMessage::decode(bytes)
                 .map_err(|e| format!("Protobuf deserialization failed: {e}"))?;
-            Ok(proto.into())
+            proto.try_into()
         }
     }
 }
@@ -109,7 +109,7 @@ pub fn deserialize_versioned_message(
         WireFormat::Protobuf => {
             let proto = ProtoVersionedRealtimeMessage::decode(bytes)
                 .map_err(|e| format!("Protobuf deserialization failed: {e}"))?;
-            Ok(proto.into())
+            proto.try_into()
         }
     }?;
 
@@ -281,6 +281,8 @@ struct ProtoAiExtras {
     transport: HashMap<String, String>,
     #[prost(map = "string, string", tag = "2")]
     codec: HashMap<String, String>,
+    #[prost(map = "string, string", tag = "3")]
+    opaque_json: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,6 +298,8 @@ struct MsgpackMessageExtras {
 struct MsgpackAiExtras {
     transport: Option<HashMap<String, String>>,
     codec: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    opaque: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -422,9 +426,11 @@ impl From<VersionedRealtimeMessage> for MsgpackVersionedRealtimeMessage {
     }
 }
 
-impl From<ProtoPusherMessage> for PusherMessage {
-    fn from(value: ProtoPusherMessage) -> Self {
-        Self {
+impl TryFrom<ProtoPusherMessage> for PusherMessage {
+    type Error = String;
+
+    fn try_from(value: ProtoPusherMessage) -> Result<Self, Self::Error> {
+        Ok(Self {
             event: value.event,
             channel: value.channel,
             data: value.data.map(Into::into),
@@ -438,10 +444,10 @@ impl From<ProtoPusherMessage> for PusherMessage {
             stream_id: value.stream_id,
             serial: value.serial,
             idempotency_key: value.idempotency_key,
-            extras: value.extras.map(Into::into),
+            extras: value.extras.map(TryInto::try_into).transpose()?,
             delta_sequence: value.delta_sequence,
             delta_conflation_key: value.delta_conflation_key,
-        }
+        })
     }
 }
 
@@ -467,32 +473,38 @@ impl From<MsgpackPusherMessage> for PusherMessage {
     }
 }
 
-impl From<ProtoVersionedRealtimeMessage> for VersionedRealtimeMessage {
-    fn from(value: ProtoVersionedRealtimeMessage) -> Self {
-        Self {
-            message: value.message.map(Into::into).unwrap_or(PusherMessage {
-                event: None,
-                channel: None,
-                data: None,
-                name: None,
-                user_id: None,
-                tags: None,
-                sequence: None,
-                conflation_key: None,
-                message_id: None,
-                stream_id: None,
-                serial: None,
-                idempotency_key: None,
-                extras: None,
-                delta_sequence: None,
-                delta_conflation_key: None,
-            }),
+impl TryFrom<ProtoVersionedRealtimeMessage> for VersionedRealtimeMessage {
+    type Error = String;
+
+    fn try_from(value: ProtoVersionedRealtimeMessage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            message: value
+                .message
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or(PusherMessage {
+                    event: None,
+                    channel: None,
+                    data: None,
+                    name: None,
+                    user_id: None,
+                    tags: None,
+                    sequence: None,
+                    conflation_key: None,
+                    message_id: None,
+                    stream_id: None,
+                    serial: None,
+                    idempotency_key: None,
+                    extras: None,
+                    delta_sequence: None,
+                    delta_conflation_key: None,
+                }),
             action: parse_message_action(&value.action),
             message_serial: value.message_serial,
             history_serial: value.history_serial,
             delivery_serial: value.delivery_serial,
             version: value.version.map(Into::into),
-        }
+        })
     }
 }
 
@@ -662,6 +674,11 @@ impl From<AiExtras> for ProtoAiExtras {
         Self {
             transport: value.transport.unwrap_or_default(),
             codec: value.codec.unwrap_or_default(),
+            opaque_json: value
+                .opaque
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string()))
+                .collect(),
         }
     }
 }
@@ -671,13 +688,16 @@ impl From<AiExtras> for MsgpackAiExtras {
         Self {
             transport: value.transport,
             codec: value.codec,
+            opaque: value.opaque,
         }
     }
 }
 
-impl From<ProtoMessageExtras> for MessageExtras {
-    fn from(value: ProtoMessageExtras) -> Self {
-        Self {
+impl TryFrom<ProtoMessageExtras> for MessageExtras {
+    type Error = String;
+
+    fn try_from(value: ProtoMessageExtras) -> Result<Self, Self::Error> {
+        Ok(Self {
             headers: (!value.headers.is_empty()).then_some(
                 value
                     .headers
@@ -689,9 +709,9 @@ impl From<ProtoMessageExtras> for MessageExtras {
             idempotency_key: value.idempotency_key,
             push: None,
             echo: value.echo,
-            ai: value.ai.map(Into::into),
+            ai: value.ai.map(TryInto::try_into).transpose()?,
             opaque: Default::default(),
-        }
+        })
     }
 }
 
@@ -711,12 +731,26 @@ impl From<MsgpackMessageExtras> for MessageExtras {
     }
 }
 
-impl From<ProtoAiExtras> for AiExtras {
-    fn from(value: ProtoAiExtras) -> Self {
-        Self {
+impl TryFrom<ProtoAiExtras> for AiExtras {
+    type Error = String;
+
+    fn try_from(value: ProtoAiExtras) -> Result<Self, Self::Error> {
+        Ok(Self {
             transport: (!value.transport.is_empty()).then_some(value.transport),
             codec: (!value.codec.is_empty()).then_some(value.codec),
-        }
+            opaque: value
+                .opaque_json
+                .into_iter()
+                .map(|(key, value)| {
+                    if matches!(key.as_str(), "transport" | "codec") {
+                        return Err("reserved AI extras extension key".to_string());
+                    }
+                    serde_json::from_str(&value)
+                        .map(|value| (key, value))
+                        .map_err(|_| "invalid AI extras extension JSON".to_string())
+                })
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -725,6 +759,7 @@ impl From<MsgpackAiExtras> for AiExtras {
         Self {
             transport: value.transport,
             codec: value.codec,
+            opaque: value.opaque,
         }
     }
 }
@@ -905,6 +940,59 @@ mod tests {
                 metadata: Some(sonic_rs::json!({"source": "test"})),
             }),
         }
+    }
+
+    #[test]
+    fn ai_codec_metadata_round_trips_in_all_wire_formats() {
+        let ai: AiExtras = serde_json::from_value(serde_json::json!({
+            "transport": { "run-id": "run-1" },
+            "codec": { "format": "test" },
+            "type": "text-delta",
+            "fields": { "id": "m1", "nested": [null, true, { "count": 3 }] },
+            "stream": true,
+            "ends": "message-1"
+        }))
+        .unwrap();
+        let mut message = sample_versioned_message();
+        message.message.extras.as_mut().unwrap().ai = Some(ai);
+        for format in [
+            WireFormat::Json,
+            WireFormat::MessagePack,
+            WireFormat::Protobuf,
+        ] {
+            let bytes = serialize_message(&message.message, format).unwrap();
+            let decoded = deserialize_message(&bytes, format).unwrap();
+            assert_eq!(decoded.extras, message.message.extras, "{format:?}");
+            let bytes = serialize_versioned_message(&message, format).unwrap();
+            let decoded = deserialize_versioned_message(&bytes, format).unwrap();
+            assert_eq!(decoded.message.extras, message.message.extras, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn protobuf_rejects_invalid_ai_metadata() {
+        for (key, raw) in [("fields", "not JSON"), ("transport", "{}"), ("codec", "{}")] {
+            let mut proto = ProtoPusherMessage::from(sample_message());
+            proto.extras.as_mut().unwrap().ai = Some(ProtoAiExtras {
+                transport: HashMap::new(),
+                codec: HashMap::new(),
+                opaque_json: HashMap::from([(key.to_string(), raw.to_string())]),
+            });
+            assert!(deserialize_message(&proto.encode_to_vec(), WireFormat::Protobuf).is_err());
+        }
+    }
+
+    #[test]
+    fn msgpack_accepts_legacy_ai_metadata_without_extensions() {
+        let bytes = rmp_serde::to_vec(&(
+            Some(HashMap::from([("run-id", "run-1")])),
+            None::<HashMap<String, String>>,
+        ))
+        .unwrap();
+        let decoded: MsgpackAiExtras = deserialize_msgpack_exact(&bytes).unwrap();
+        assert!(decoded.opaque.is_empty());
+        assert_eq!(rmp_serde::to_vec(&decoded).unwrap(), bytes);
+        assert_eq!(decoded.transport.unwrap()["run-id"], "run-1");
     }
 
     #[test]

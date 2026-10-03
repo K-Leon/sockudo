@@ -146,11 +146,15 @@ On SIGTERM or SIGINT, Sockudo:
 
 1. Reports not ready: `/up` and `/ready` return 503 `DRAINING` and new WebSocket upgrades are
    rejected with 503. The listener stays open and HTTP API requests are still served.
-2. Waits `shutdown_grace_period` seconds so load balancers can remove the node.
-3. Closes existing connections with code 4200, disconnects from backends, and exits.
+2. Closes existing connections immediately with code 4200 so clients reconnect right away
+   instead of waiting for the grace period or a load-balancer cutoff.
+3. Keeps the listener open for `shutdown_grace_period` seconds so load balancers finish
+   deregistration without connection-refused errors, then disconnects from backends and exits.
 
-Set `shutdown_grace_period` longer than your load balancer's deregistration time (for a
-readiness probe, roughly `periodSeconds × failureThreshold` plus endpoint propagation). Then:
+Set `shutdown_grace_period` to cover your load balancer's deregistration time (for a
+readiness probe, roughly `periodSeconds × failureThreshold` plus endpoint propagation). Keep
+it well below the load balancer's connection-draining timeout, otherwise the balancer cuts
+idle WebSocket connections before Sockudo finishes deregistering. Then:
 
 1. Keep adapter and cache dependencies available.
 2. Watch reconnect, resume, and missed-message metrics.

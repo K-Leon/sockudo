@@ -438,10 +438,10 @@ pub(super) fn message_version_from_runtime_headers(
 
 pub(super) fn ably_extras_from_message_extras(extras: &MessageExtras) -> Option<Value> {
     let mut visible = extras.clone();
-    visible.ephemeral = None;
     visible.idempotency_key = None;
     visible.echo = None;
     if visible.headers.is_none()
+        && visible.ephemeral.is_none()
         && visible.push.is_none()
         && visible.ai.is_none()
         && visible.opaque.is_empty()
@@ -461,7 +461,10 @@ pub(super) fn ably_extras_to_message_extras(
         AppError::InvalidInput("message.extras must be a JSON object".to_string())
     })?;
     for (key, _) in object {
-        if !matches!(key, "ai" | "echo" | "headers" | "push" | "ref") {
+        if !matches!(
+            key,
+            "ai" | "echo" | "ephemeral" | "headers" | "push" | "ref"
+        ) {
             return Err(AppError::InvalidInput(format!(
                 "Unsupported Ably message.extras field '{key}'"
             )));

@@ -58,6 +58,7 @@ fn ai_record(message_serial: &str, delivery_serial: u64, status: &str) -> Stored
     let mut record = base_record(message_serial, delivery_serial, delivery_serial);
     record.message.extras = Some(MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([("status".to_string(), status.to_string())])),
             codec: None,
         }),

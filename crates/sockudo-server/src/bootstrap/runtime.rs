@@ -470,6 +470,10 @@ impl SockudoServer {
             || self.shutdown_signal(),
             &self.state.running,
             Duration::from_secs(self.config.shutdown_grace_period),
+            Some(|| {
+                let server = self;
+                async move { server.close_all_connections().await }
+            }),
             name,
         )
         .await;
@@ -499,44 +503,29 @@ impl SockudoServer {
         }
     }
 
-    pub(crate) async fn stop(&self) -> Result<()> {
-        info!("Stopping server...");
-        self.state.running.store(false, Ordering::SeqCst);
-        self.handler.shutdown_ai_workers().await;
-
-        // Tell cluster peers this node is leaving and no responses are expected.
-        if !self.config.server_role.is_api()
-            && let Err(e) = self
-                .state
-                .connection_manager
-                .announce_node_departure()
-                .await
-        {
-            warn!(error = %e, "failed to announce node departure");
-        }
-
+    /// Close every live websocket with `4200 Server shutting down` so clients
+    /// reconnect immediately instead of waiting for the listener grace period
+    /// or an LB deregistration cutoff.
+    pub(crate) async fn close_all_connections(&self) {
         let mut connections_to_cleanup: Vec<(String, WebSocketRef)> = Vec::new();
 
-        {
-            match self.state.connection_manager.get_namespaces().await {
-                Ok(namespaces_vec) => {
-                    for (app_id, namespace_obj) in namespaces_vec {
-                        match namespace_obj.get_sockets().await {
-                            Ok(sockets_vec) => {
-                                for (_socket_id, ws_raw_obj) in sockets_vec {
-                                    connections_to_cleanup
-                                        .push((app_id.clone(), ws_raw_obj.clone()));
-                                }
+        match self.state.connection_manager.get_namespaces().await {
+            Ok(namespaces_vec) => {
+                for (app_id, namespace_obj) in namespaces_vec {
+                    match namespace_obj.get_sockets().await {
+                        Ok(sockets_vec) => {
+                            for (_socket_id, ws_raw_obj) in sockets_vec {
+                                connections_to_cleanup.push((app_id.clone(), ws_raw_obj.clone()));
                             }
-                            Err(e) => {
-                                warn!(%app_id, error = %e, "failed to get sockets for namespace during shutdown");
-                            }
+                        }
+                        Err(e) => {
+                            warn!(%app_id, error = %e, "failed to get sockets for namespace during shutdown");
                         }
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "failed to get namespaces during shutdown");
-                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to get namespaces during shutdown");
             }
         }
 
@@ -561,6 +550,27 @@ impl SockudoServer {
         } else {
             info!("No connections to cleanup.");
         }
+    }
+
+    pub(crate) async fn stop(&self) -> Result<()> {
+        info!("Stopping server...");
+        self.state.running.store(false, Ordering::SeqCst);
+        self.handler.shutdown_ai_workers().await;
+
+        // Tell cluster peers this node is leaving and no responses are expected.
+        if !self.config.server_role.is_api()
+            && let Err(e) = self
+                .state
+                .connection_manager
+                .announce_node_departure()
+                .await
+        {
+            warn!(error = %e, "failed to announce node departure");
+        }
+
+        // Connections were already closed with 4200 by the first shutdown
+        // signal; this covers direct stop() callers that skip the signal path.
+        self.close_all_connections().await;
 
         if self.state.cleanup_worker_handles.is_some() {
             info!("Cleanup system will shutdown when server process ends");
@@ -613,18 +623,22 @@ impl SockudoServer {
     }
 }
 
-/// Runs `server` until a shutdown signal, then clears `running` and keeps the
-/// listener open for `grace_period` so load balancers can observe the 503s from
-/// `/up` and `/ready` before it closes. A second signal ends the grace period early.
-async fn serve_until_shutdown<F, S>(
+/// Runs `server` until a shutdown signal, closes existing connections via
+/// `on_shutdown` (typically with code 4200 so clients reconnect immediately),
+/// then keeps the listener open for `grace_period` so load balancers can
+/// observe the 503s from `/up` and `/ready` before it closes. A second signal
+/// ends the grace period early.
+async fn serve_until_shutdown<F, S, T>(
     server: F,
     shutdown: impl Fn() -> S,
     running: &AtomicBool,
     grace_period: Duration,
+    on_shutdown: Option<impl FnOnce() -> T>,
     name: &str,
 ) where
     F: IntoFuture<Output = std::io::Result<()>>,
     S: Future<Output = ()>,
+    T: Future<Output = ()>,
 {
     let server = server.into_future();
     tokio::pin!(server);
@@ -640,6 +654,12 @@ async fn serve_until_shutdown<F, S>(
             info!("Shutdown signal received, stopping {name} server...");
             running.store(false, Ordering::SeqCst);
         }
+    }
+
+    // Close existing connections before the grace period so clients get the
+    // WebSocket Close frame (4200) instead of an LB cutoff or process kill.
+    if let Some(on_shutdown) = on_shutdown {
+        on_shutdown().await;
     }
 
     if grace_period.is_zero() {
@@ -744,6 +764,7 @@ mod tests {
                 },
                 &server_running,
                 grace_period,
+                None::<fn() -> std::future::Ready<()>>,
                 "test",
             )
             .await;
@@ -803,5 +824,74 @@ mod tests {
             .await
             .expect("grace period did not end on the second signal")
             .unwrap();
+    }
+
+    /// The on_shutdown hook must run before the grace period elapses so
+    /// existing connections receive their Close frame (4200) while the
+    /// listener is still open, instead of being cut by a process kill or LB
+    /// deregistration first.
+    #[tokio::test]
+    async fn on_shutdown_closes_connections_before_grace_period_ends() {
+        let closed_at: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let grace_period = Duration::from_millis(500);
+
+        let running = Arc::new(AtomicBool::new(true));
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_running = running.clone();
+        let server_signal = signal.clone();
+        let hook_closed = closed_at.clone();
+        let handle = tokio::spawn(async move {
+            serve_until_shutdown(
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/ready", get(|| async { StatusCode::SERVICE_UNAVAILABLE })),
+                ),
+                || {
+                    let signal = server_signal.clone();
+                    async move { signal.notified().await }
+                },
+                &server_running,
+                grace_period,
+                Some(move || {
+                    let hook_closed = hook_closed.clone();
+                    async move {
+                        hook_closed.store(true, Ordering::SeqCst);
+                    }
+                }),
+                "test",
+            )
+            .await;
+        });
+
+        signal.notify_one();
+        wait_until_draining(&running).await;
+
+        // The hook must have completed long before the 500 ms grace period ends.
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while !closed_at.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("on_shutdown hook did not run before the grace period elapsed");
+
+        // Listener must still be serving during the grace period.
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert_eq!(
+            response.lines().next().unwrap_or_default(),
+            "HTTP/1.1 503 Service Unavailable"
+        );
+
+        handle.await.unwrap();
     }
 }

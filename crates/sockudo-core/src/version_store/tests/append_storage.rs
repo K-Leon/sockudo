@@ -538,6 +538,7 @@ async fn terminal_state_and_limits_apply_to_compact_latest_versions() {
     // A terminal append persists its status in the compact latest version.
     let extras = sockudo_protocol::messages::MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 "status".to_string(),
                 "complete".to_string(),
