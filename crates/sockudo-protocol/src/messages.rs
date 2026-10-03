@@ -220,6 +220,12 @@ pub struct AiExtras {
     pub transport: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<HashMap<String, String>>,
+
+    /// Opaque codec metadata, including Ably AI Transport's `type`, nested
+    /// `fields`, `stream`, and `ends`. Native transport/codec headers remain
+    /// typed and validated separately.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub opaque: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,6 +551,16 @@ impl MessageExtras {
         let Some(ai) = self.ai.as_ref() else {
             return Ok(());
         };
+
+        if ai
+            .opaque
+            .keys()
+            .any(|key| matches!(key.as_str(), "transport" | "codec"))
+        {
+            return Err(AiHeaderValidationError::invalid_transport(
+                "opaque AI metadata must not shadow transport or codec headers",
+            ));
+        }
 
         if let Some(transport) = ai.transport.as_ref() {
             validate_ai_tier("transport", transport, limits)?;
@@ -1790,6 +1806,7 @@ mod tests {
             idempotency_key: Some("idempotency-secret".to_string()),
             extras: Some(MessageExtras {
                 ai: Some(AiExtras {
+                    opaque: Default::default(),
                     transport: Some(transport),
                     codec: None,
                 }),

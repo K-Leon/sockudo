@@ -1085,6 +1085,7 @@ mod tests {
         let mut transport = HashMap::new();
         transport.insert("status".to_string(), "complete".to_string());
         message.extras.get_or_insert_with(MessageExtras::default).ai = Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(transport),
             codec: None,
         });

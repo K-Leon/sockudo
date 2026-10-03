@@ -613,6 +613,7 @@ mod tests {
         transport.insert("status".to_string(), "streaming".to_string());
         MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: Some(transport),
                 ..AiExtras::default()
             }),

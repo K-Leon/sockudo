@@ -23,6 +23,7 @@ fn message_with_headers(headers: &[(&str, &str)]) -> PusherMessage {
         idempotency_key: None,
         extras: Some(MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: Some(transport),
                 codec: None,
             }),

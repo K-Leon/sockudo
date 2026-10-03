@@ -9,6 +9,7 @@ use std::hint::black_box;
 fn sample_ai_extras() -> MessageExtras {
     MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([
                 ("run-id".to_string(), "turn-1".to_string()),
                 ("invocation-id".to_string(), "invoke-1".to_string()),
