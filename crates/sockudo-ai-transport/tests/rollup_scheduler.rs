@@ -26,6 +26,7 @@ fn append(serial: &str, data: &str, fragment: &str, version: i64) -> PusherMessa
         idempotency_key: None,
         extras: Some(MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: Some(HashMap::from([
                     ("status".to_string(), "streaming".to_string()),
                     ("append-fragment".to_string(), fragment.to_string()),

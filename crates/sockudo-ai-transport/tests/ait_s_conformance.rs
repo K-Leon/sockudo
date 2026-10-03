@@ -55,6 +55,7 @@ fn create_message(
 fn ai_extras(headers: &[(&str, &str)]) -> MessageExtras {
     MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(
                 headers
                     .iter()
@@ -451,6 +452,7 @@ fn ait_s055_to_s064_ai_event_and_header_rules_match_registry() {
 
     let too_many = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(
                 (0..=AI_TRANSPORT_TIER_LIMIT)
                     .map(|index| (format!("x{index}"), "v".to_string()))

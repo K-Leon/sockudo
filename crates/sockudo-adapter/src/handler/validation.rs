@@ -891,6 +891,7 @@ mod tests {
             idempotency_key: None,
             extras: Some(MessageExtras {
                 ai: Some(AiExtras {
+                    opaque: Default::default(),
                     transport: Some(HashMap::from([(
                         "input-client-id".to_string(),
                         "attacker".to_string(),
@@ -928,6 +929,7 @@ mod tests {
             idempotency_key: None,
             extras: Some(MessageExtras {
                 ai: Some(AiExtras {
+                    opaque: Default::default(),
                     transport: Some(HashMap::from([(
                         "run-client-id".to_string(),
                         "server-agent".to_string(),
@@ -961,6 +963,7 @@ mod tests {
                 idempotency_key: None,
                 extras: Some(MessageExtras {
                     ai: Some(AiExtras {
+                        opaque: Default::default(),
                         transport: Some(HashMap::from([(key.to_string(), String::new())])),
                         codec: None,
                     }),
@@ -1001,6 +1004,7 @@ mod tests {
                 idempotency_key: None,
                 extras: Some(MessageExtras {
                     ai: Some(AiExtras {
+                        opaque: Default::default(),
                         transport: Some(HashMap::from([(key.to_string(), String::new())])),
                         codec: None,
                     }),

@@ -384,6 +384,7 @@ mod tests {
             idempotency_key: None,
             extras: Some(MessageExtras {
                 ai: Some(AiExtras {
+                    opaque: Default::default(),
                     transport: Some(transport),
                     codec: None,
                 }),

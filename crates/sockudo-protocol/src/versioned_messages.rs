@@ -514,6 +514,7 @@ mod tests {
             data: String::new(),
             extras: Some(MessageExtras {
                 ai: Some(crate::messages::AiExtras {
+                    opaque: Default::default(),
                     codec: Some(HashMap::from([(
                         "status".to_string(),
                         "complete".to_string(),

@@ -412,6 +412,7 @@ pub(crate) fn test_versioned_record(
 pub(crate) fn ai_extras(status: &str) -> MessageExtras {
     MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([("status".to_string(), status.to_string())])),
             codec: Some(HashMap::from([(
                 "content-type".to_string(),

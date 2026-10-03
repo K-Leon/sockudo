@@ -137,6 +137,7 @@ fn test_ai_transport_headers_are_borrowed_views() {
 
     let extras = sockudo_protocol::messages::MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(transport),
             codec: Some(HashMap::from([(
                 "encoding".to_string(),
@@ -166,6 +167,7 @@ fn test_ai_transport_headers_are_borrowed_views() {
 fn test_ai_header_validation_rejects_limits_and_domains() {
     let oversized = sockudo_protocol::messages::MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_RUN_ID.to_string(),
                 "x".repeat(257),
@@ -181,6 +183,7 @@ fn test_ai_header_validation_rejects_limits_and_domains() {
 
     let bad_key = sockudo_protocol::messages::MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([("TurnId".to_string(), "x".to_string())])),
             codec: None,
         }),
@@ -193,6 +196,7 @@ fn test_ai_header_validation_rejects_limits_and_domains() {
 
     let bad_status = sockudo_protocol::messages::MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([("status".to_string(), "done".to_string())])),
             codec: None,
         }),
@@ -208,6 +212,7 @@ fn test_ai_header_validation_rejects_limits_and_domains() {
 fn test_ai_codec_headers_accept_ably_camel_case_keys() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_RUN_ID.to_string(),
                 "run-1".to_string(),
@@ -235,6 +240,7 @@ fn test_ai_codec_provider_metadata_accepts_ably_sized_payloads() {
 
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_RUN_ID.to_string(),
                 "run-1".to_string(),
@@ -254,6 +260,7 @@ fn test_ai_codec_provider_metadata_accepts_ably_sized_payloads() {
 fn test_ai_codec_provider_metadata_remains_bounded() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: None,
             codec: Some(HashMap::from([(
                 "providerMetadata".to_string(),
@@ -276,6 +283,7 @@ fn test_ai_codec_provider_metadata_remains_bounded() {
 fn test_ai_codec_other_values_stay_small() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: None,
             codec: Some(HashMap::from([(
                 "finishReason".to_string(),
@@ -295,6 +303,7 @@ fn test_ai_codec_other_values_stay_small() {
 fn test_ai_codec_headers_reject_unsafe_keys() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: None,
             codec: Some(HashMap::from([(
                 "message.id".to_string(),
@@ -314,6 +323,7 @@ fn test_ai_codec_headers_reject_unsafe_keys() {
 fn test_ai_transport_model_key_accepted() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([
                 (AI_HEADER_RUN_ID.to_string(), "run-1".to_string()),
                 ("model".to_string(), "gpt-4o".to_string()),
@@ -333,6 +343,7 @@ fn test_ai_transport_model_key_accepted() {
 fn test_ai_transport_model_key_rejects_empty() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([("model".to_string(), "".to_string())])),
             codec: None,
         }),
@@ -368,6 +379,7 @@ fn test_ai_transport_identity_keys_reject_empty_except_native_unknown_owners() {
     for (key, allowed) in identity_keys {
         let extras = MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: Some(HashMap::from([(key.to_string(), String::new())])),
                 codec: None,
             }),
@@ -408,6 +420,7 @@ fn test_configured_steer_ceiling_does_not_widen_scalar_values() {
     };
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_RUN_ID.to_string(),
                 "x".repeat(AI_TRANSPORT_VALUE_MAX_BYTES + 1),
@@ -451,6 +464,7 @@ fn test_ai_transport_accepts_steer_codec_message_ids_header() {
     let ids = r#"["msg_1","msg_2"]"#;
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_STEER_CODEC_MESSAGE_IDS.to_string(),
                 ids.to_string(),
@@ -473,6 +487,7 @@ fn steer_ids_json(count: usize) -> String {
 fn steer_extras(value: String) -> MessageExtras {
     MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_STEER_CODEC_MESSAGE_IDS.to_string(),
                 value,
@@ -510,6 +525,7 @@ fn test_steer_codec_message_ids_exceeds_the_generic_scalar_budget() {
 fn test_per_key_steer_allowance_does_not_widen_other_transport_keys() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_RUN_ID.to_string(),
                 "x".repeat(AI_TRANSPORT_VALUE_MAX_BYTES + 1),
@@ -547,6 +563,7 @@ fn test_ai_transport_accepts_run_continue_header() {
     for (value, allowed) in [("true", true), ("false", true), ("yes", false), ("", false)] {
         let extras = MessageExtras {
             ai: Some(AiExtras {
+                opaque: Default::default(),
                 transport: Some(HashMap::from([(
                     AI_HEADER_RUN_CONTINUE.to_string(),
                     value.to_string(),
@@ -569,6 +586,7 @@ fn test_ai_transport_still_accepts_legacy_turn_continue_header() {
     // Pre-3.0 producers wrote `turn-continue`; history must stay readable.
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 "turn-continue".to_string(),
                 "true".to_string(),
@@ -585,6 +603,7 @@ fn test_ai_transport_still_accepts_legacy_turn_continue_header() {
 fn test_ai_transport_rejects_obsolete_start_serial_header() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 "start-serial".to_string(),
                 "serial-1".to_string(),
@@ -606,6 +625,7 @@ fn test_ai_transport_rejects_obsolete_start_serial_header() {
 fn test_ai_transport_unknown_owner_sentinels_are_wire_preserved_but_not_identities() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([
                 (AI_HEADER_RUN_ID.to_string(), "run-1".to_string()),
                 (AI_HEADER_RUN_CLIENT_ID.to_string(), String::new()),
@@ -630,6 +650,7 @@ fn test_ai_transport_unknown_owner_sentinels_are_wire_preserved_but_not_identiti
 fn test_ai_transport_model_key_optional() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_RUN_ID.to_string(),
                 "run-1".to_string(),
@@ -648,6 +669,7 @@ fn test_ai_transport_model_key_optional() {
 fn test_ai_transport_msg_regenerate_accepts_ably_message_id() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([
                 (AI_HEADER_RUN_ID.to_string(), "run-1".to_string()),
                 (
@@ -672,6 +694,7 @@ fn test_ai_transport_msg_regenerate_accepts_ably_message_id() {
 fn test_ai_transport_msg_regenerate_rejects_empty() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_MSG_REGENERATE.to_string(),
                 "".to_string(),
@@ -691,6 +714,7 @@ fn test_ai_transport_msg_regenerate_rejects_empty() {
 fn test_ai_transport_supersedes_accepts_run_id() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([
                 (AI_HEADER_RUN_ID.to_string(), "run-fork".to_string()),
                 (AI_HEADER_SUPERSEDES.to_string(), "run-trunk".to_string()),
@@ -714,6 +738,7 @@ fn test_ai_transport_supersedes_accepts_run_id() {
 fn test_ai_transport_supersedes_rejects_empty() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_SUPERSEDES.to_string(),
                 String::new(),
@@ -733,6 +758,7 @@ fn test_ai_transport_supersedes_rejects_empty() {
 fn test_ai_transport_legacy_turn_id_alias_is_still_readable() {
     let extras = MessageExtras {
         ai: Some(AiExtras {
+            opaque: Default::default(),
             transport: Some(HashMap::from([(
                 AI_HEADER_LEGACY_TURN_ID.to_string(),
                 "legacy-turn-1".to_string(),
