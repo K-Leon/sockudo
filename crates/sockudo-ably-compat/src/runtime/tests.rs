@@ -2732,6 +2732,118 @@ fn append_base_tracking_is_bounded_and_forgets_filtered_mutations() {
     assert!(!known.contains("1"));
 }
 
+#[tokio::test]
+async fn shared_append_bases_respect_late_join_replay_echo_and_mode_changes() {
+    for format in [AblyFormat::Json, AblyFormat::MsgPack] {
+        let hub = AblyCompatHub::default();
+        let channel = AblyChannelName::parse("shared-append-room".to_string()).unwrap();
+        let frame = |action| AblyProtocolMessage {
+            channel: Some(channel.base().to_string()),
+            messages: Some(vec![AblyMessage {
+                serial: Some("base".to_string()),
+                action: Some(action),
+                ..AblyMessage::default()
+            }]),
+            ..empty_protocol_message(ACTION_MESSAGE)
+        };
+        let attach = |session_id: &str, replay| {
+            let (sender, receiver) =
+                AblyOutbound::channel(format, OutboundLimits::default(), Arc::clone(&hub.metrics));
+            hub.attach_clean(
+                "app",
+                &channel,
+                AblyAttachment {
+                    connection_id: session_id,
+                    session_id,
+                    sender,
+                    filter: None,
+                    params: HashMap::new(),
+                    mode_flags: ABLY_DEFAULT_MODE_FLAGS,
+                    echo: true,
+                    presence: Vec::new(),
+                },
+                None,
+                replay,
+                false,
+            );
+            receiver
+        };
+        let assert_next = async |receiver: &mut crate::outbound::AblyOutboundReceiver, action| {
+            let delivered = receiver.recv().await.expect("expected delivery");
+            let delivered = decode_protocol_bytes(delivered.bytes.as_ref(), format).unwrap();
+            assert_eq!(delivered.messages.unwrap()[0].action, Some(action));
+        };
+        let append = |publisher, echo_override| {
+            hub.broadcast_with_append_projection(
+                "app",
+                channel.base(),
+                frame(MESSAGE_APPEND),
+                Some(frame(MESSAGE_UPDATE)),
+                publisher,
+                echo_override,
+            )
+        };
+
+        let mut early = attach("early", Vec::new());
+        early.recv().await.expect("ATTACHED");
+        hub.broadcast("app", channel.base(), frame(MESSAGE_CREATE), None, None);
+        assert_next(&mut early, MESSAGE_CREATE).await;
+
+        let mut late = attach("late", Vec::new());
+        late.recv().await.expect("ATTACHED");
+        let mut replayed = attach("replayed", vec![frame(MESSAGE_CREATE)]);
+        replayed.recv().await.expect("ATTACHED");
+        assert_next(&mut replayed, MESSAGE_CREATE).await;
+
+        append(None, None);
+        assert_next(&mut early, MESSAGE_APPEND).await;
+        assert_next(&mut late, MESSAGE_UPDATE).await;
+        assert_next(&mut replayed, MESSAGE_APPEND).await;
+
+        // Missing a mutation invalidates only that attachment's base.
+        for skip_echo in [true, false] {
+            if !skip_echo {
+                hub.update_subscriber_mode_flags("app", &channel, "early", ABLY_MODE_PUBLISH);
+            }
+            append(skip_echo.then_some("early"), skip_echo.then_some(false));
+            assert_next(&mut late, MESSAGE_APPEND).await;
+            assert_next(&mut replayed, MESSAGE_APPEND).await;
+            hub.update_subscriber_mode_flags("app", &channel, "early", ABLY_DEFAULT_MODE_FLAGS);
+            append(None, None);
+            assert_next(&mut early, MESSAGE_UPDATE).await;
+            assert_next(&mut late, MESSAGE_APPEND).await;
+            assert_next(&mut replayed, MESSAGE_APPEND).await;
+            append(None, None);
+            assert_next(&mut early, MESSAGE_APPEND).await;
+            assert_next(&mut late, MESSAGE_APPEND).await;
+            assert_next(&mut replayed, MESSAGE_APPEND).await;
+        }
+    }
+}
+
+#[test]
+fn individual_append_bases_only_copy_messages_seen_since_attachment() {
+    let frame = |serial: &str| AblyProtocolMessage {
+        messages: Some(vec![AblyMessage {
+            serial: Some(serial.to_string()),
+            action: Some(MESSAGE_CREATE),
+            ..AblyMessage::default()
+        }]),
+        ..empty_protocol_message(ACTION_MESSAGE)
+    };
+    let mut shared = AblyKnownMessages::default();
+    shared.observe(&frame("before-attach"), None);
+    let mut subscriber = AblySubscriberKnowledge::new(shared.sequence, false);
+    shared.observe(&frame("retained"), None);
+    shared.observe(&frame("missed"), None);
+    subscriber.forget(&frame("missed"), &shared);
+    assert!(!subscriber.knows(&frame("before-attach"), None));
+    assert!(subscriber.knows(&frame("retained"), None));
+    assert!(!subscriber.knows(&frame("missed"), None));
+    subscriber.observe(&frame("missed"), None);
+    assert!(subscriber.knows(&frame("missed"), None));
+}
+
 #[test]
 fn contiguous_delivery_frontier_suppresses_old_duplicates_without_growing_memory() {
     let hub = AblyCompatHub::default();

@@ -45,6 +45,7 @@ fuzz_target!(|data: &[u8]| {
         ai: Some(AiExtras {
             transport: Some(transport.clone()),
             codec: Some(codec.clone()),
+            ..Default::default()
         }),
         ..Default::default()
     };
