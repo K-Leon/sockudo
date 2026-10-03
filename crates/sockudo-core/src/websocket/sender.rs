@@ -140,6 +140,13 @@ impl MessageSender {
                 }
             }
 
+            // The writer stopped before a close frame (write error, channel closed): a close() waiting
+            // for its frame holds the connection lock and would wait forever, so no disconnect could
+            // run for this socket. Cancelling makes that close() return and stops the reader.
+            if !is_shutting_down {
+                shutdown_token.cancel();
+            }
+
             if !is_shutting_down && let Err(e) = socket.close(1000, "Normal closure").await {
                 Self::log_connection_error(&e, SocketOperation::SendCloseFrame, msg_count, true);
             }

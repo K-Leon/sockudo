@@ -582,15 +582,13 @@ impl ConnectionHandler {
             connection_manager.get_connection(socket_id, app_id).await
         };
 
+        // Wait for the lock: a busy connection is not one that is already disconnecting, and
+        // skipping here left it in the adapter for good.
         let already_disconnecting = if let Some(conn) = conn {
-            if let Ok(mut conn_locked) = conn.inner.try_lock() {
-                let was_disconnecting = conn_locked.state.disconnecting;
-                conn_locked.state.disconnecting = true;
-                was_disconnecting
-            } else {
-                debug!(socket_id = %socket_id, "connection busy during disconnect");
-                true
-            }
+            let mut conn_locked = conn.inner.lock().await;
+            let was_disconnecting = conn_locked.state.disconnecting;
+            conn_locked.state.disconnecting = true;
+            was_disconnecting
         } else {
             true
         };

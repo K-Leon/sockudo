@@ -99,16 +99,11 @@ impl ConnectionHandler {
                     if !ws.is_connected() {
                         debug!(socket_id = %socket_id_clone, "closed connection cleanup started");
                         drop(ws);
-                        if let Err(e) = handler
-                            .handle_disconnect(&app_id_clone, &socket_id_clone)
-                            .await
-                        {
-                            warn!(
-                                socket_id = %socket_id_clone,
-                                error = %e,
-                                "closed connection cleanup failed"
-                            );
-                        }
+                        handler.spawn_disconnect(
+                            &app_id_clone,
+                            socket_id_clone,
+                            "closed connection",
+                        );
                         break;
                     }
                     ws.state.status = sockudo_core::websocket::ConnectionStatus::PingSent(
@@ -152,16 +147,11 @@ impl ConnectionHandler {
                                     .close(4201, "Pong reply not received in time".to_string())
                                     .await;
                                 drop(ws);
-                                if let Err(e) = handler
-                                    .handle_disconnect(&app_id_clone, &socket_id_clone)
-                                    .await
-                                {
-                                    warn!(
-                                        socket_id = %socket_id_clone,
-                                        error = %e,
-                                        "timeout disconnect handling failed"
-                                    );
-                                }
+                                handler.spawn_disconnect(
+                                    &app_id_clone,
+                                    socket_id_clone,
+                                    "pong timeout",
+                                );
                                 break;
                             }
                         }
@@ -178,17 +168,12 @@ impl ConnectionHandler {
                             "activity timeout ping send failed"
                         );
 
-                        if let Err(e) = handler
-                            .handle_disconnect(&app_id_clone, &socket_id_clone)
-                            .await
-                        {
-                            warn!(
-                                socket_id = %socket_id_clone,
-                                error = %e,
-                                "disconnect handling after ping failure failed"
-                            );
-                        }
-                        break; // Exit the loop after cleanup
+                        handler.spawn_disconnect(
+                            &app_id_clone,
+                            socket_id_clone,
+                            "ping send failed",
+                        );
+                        break; // Cleanup runs in its own task
                     }
                 }
             }
@@ -202,6 +187,21 @@ impl ConnectionHandler {
         }
 
         Ok(())
+    }
+
+    /// Runs `handle_disconnect` in its own task. The activity-timeout task must not run it
+    /// inline: `handle_disconnect` marks the connection `disconnecting` and then aborts the
+    /// activity task (`clear_activity_timeout`), so any later await that is pending (a contended
+    /// connection lock) dropped the cleanup half-done. The connection then stayed in the adapter
+    /// and its presence channels forever, because every later disconnect saw `disconnecting`.
+    fn spawn_disconnect(&self, app_id: &str, socket_id: SocketId, reason: &'static str) {
+        let handler = self.clone();
+        let app_id = app_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = handler.handle_disconnect(&app_id, &socket_id).await {
+                warn!(socket_id = %socket_id, error = %e, reason, "activity timeout disconnect failed");
+            }
+        });
     }
 
     pub async fn clear_activity_timeout(&self, app_id: &str, socket_id: &SocketId) -> Result<()> {

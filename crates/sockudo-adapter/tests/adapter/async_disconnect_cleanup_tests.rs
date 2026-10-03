@@ -302,3 +302,198 @@ async fn queue_fallback_remains_idempotent() {
         "lifecycle metric must change exactly once regardless of fallback path"
     );
 }
+
+async fn add_v1_socket(
+    adapter: &Arc<LocalAdapter>,
+    app_manager: &Arc<MemoryAppManager>,
+) -> (SocketId, WebSocketStream<WsStream<Http1>>) {
+    let socket_id = SocketId::new();
+    let (writer, client) = make_ws_pair().await;
+    adapter
+        .add_socket(
+            socket_id,
+            writer,
+            APP_ID,
+            app_manager.clone() as Arc<dyn AppManager + Send + Sync>,
+            WebSocketBufferConfig::default(),
+            ProtocolVersion::V1,
+            WireFormat::Json,
+            true,
+            sockudo_protocol::AppendMode::Delta,
+        )
+        .await
+        .unwrap();
+    (socket_id, client)
+}
+
+/// Regression: the activity-timeout task ran `handle_disconnect` inline. That marks the connection
+/// `disconnecting` and then aborts the activity task itself (`clear_activity_timeout`); the next
+/// contended lock made the aborted task drop the cleanup half-done (nothing queued, no
+/// `mark_disconnection`), and the reader's later cleanup returned early on `disconnecting`.
+/// The connection stayed in the adapter and its presence channels forever.
+#[tokio::test(flavor = "current_thread")]
+async fn activity_timeout_disconnect_survives_abort_of_its_own_task() {
+    let (tx, rx) = mpsc::bounded_async::<DisconnectTask>(10);
+    let metrics = Arc::new(CountingMetrics::new());
+    let app_manager = Arc::new(MemoryAppManager::new());
+    app_manager.create_app(make_app()).await.unwrap();
+    let adapter = Arc::new(LocalAdapter::new());
+    adapter.init().await;
+    let handler = ConnectionHandler::builder(
+        app_manager.clone() as Arc<dyn AppManager + Send + Sync>,
+        adapter.clone() as Arc<dyn ConnectionManager + Send + Sync>,
+        Arc::new(NullCacheManager),
+        ServerOptions {
+            activity_timeout: 1,
+            ..ServerOptions::default()
+        },
+    )
+    .local_adapter(adapter.clone())
+    .cleanup_queue(CleanupSender::Direct(tx))
+    .metrics(metrics.clone() as Arc<dyn MetricsInterface + Send + Sync>)
+    .build();
+
+    let (socket_id, _client) = add_v1_socket(&adapter, &app_manager).await;
+    let conn = adapter.get_connection(&socket_id, APP_ID).await.unwrap();
+    // The socket is already closed and idle, so the activity task takes its "closed connection" branch.
+    {
+        let mut ws = conn.inner.lock().await;
+        ws.state.status = sockudo_core::websocket::ConnectionStatus::Closed;
+        ws.state.last_ping = Instant::now() - Duration::from_secs(60);
+    }
+    handler
+        .set_activity_timeout(APP_ID, &socket_id)
+        .await
+        .unwrap();
+
+    // Another task keeps queueing for the connection lock (tokio's Mutex is FIFO), so every lock
+    // the activity task requests after releasing one is pending.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let contender = {
+        let conn = conn.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::SeqCst) {
+                let guard = conn.inner.lock().await;
+                tokio::task::yield_now().await;
+                drop(guard);
+            }
+        })
+    };
+    // The activity task (first check after 1 s) must hand the disconnect to the cleanup queue
+    // itself; the aborted inline version never got there.
+    let task = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("activity timeout must queue the disconnect")
+        .expect("cleanup queue must remain open");
+    assert_eq!(task.socket_id, socket_id);
+    stop.store(true, Ordering::SeqCst);
+    contender.await.unwrap();
+
+    // The reader's cleanup once the socket is gone (cleanup_socket) must not count it twice.
+    handler
+        .handle_ungraceful_disconnect(APP_ID, &socket_id)
+        .await
+        .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "disconnect must be queued only once"
+    );
+    assert_eq!(
+        metrics.disconnections(),
+        1,
+        "connection must be counted as gone once"
+    );
+    assert!(conn.cancellation_token().is_cancelled());
+}
+
+/// Regression: without the async queue, a disconnect that found the connection lock busy treated
+/// it as "already disconnecting" and returned without any cleanup.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_disconnect_waits_for_busy_connection_lock() {
+    let metrics = Arc::new(CountingMetrics::new());
+    let app_manager = Arc::new(MemoryAppManager::new());
+    app_manager.create_app(make_app()).await.unwrap();
+    let adapter = Arc::new(LocalAdapter::new());
+    adapter.init().await;
+    let handler = ConnectionHandler::builder(
+        app_manager.clone() as Arc<dyn AppManager + Send + Sync>,
+        adapter.clone() as Arc<dyn ConnectionManager + Send + Sync>,
+        Arc::new(NullCacheManager),
+        ServerOptions::default(),
+    )
+    .local_adapter(adapter.clone())
+    .metrics(metrics.clone() as Arc<dyn MetricsInterface + Send + Sync>)
+    .build();
+
+    let (socket_id, _client) = add_v1_socket(&adapter, &app_manager).await;
+    let conn = adapter.get_connection(&socket_id, APP_ID).await.unwrap();
+
+    let guard = conn.inner.lock().await;
+    let disconnect = handler.handle_disconnect(APP_ID, &socket_id);
+    tokio::pin!(disconnect);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut disconnect)
+            .await
+            .is_err(),
+        "disconnect must wait for the busy connection lock, not skip the cleanup"
+    );
+    drop(guard);
+    disconnect.await.unwrap();
+
+    assert!(
+        adapter.get_connection(&socket_id, APP_ID).await.is_none(),
+        "connection must be removed"
+    );
+    assert_eq!(metrics.disconnections(), 1);
+}
+
+/// Regression: a client that stopped reading blocks the writer in a socket write; a `close()`
+/// queued behind it waits for its frame while holding the connection lock. When the socket then
+/// died, the writer exited without telling anyone, so `close()` and everything queued on the lock
+/// (the reader's cleanup, any disconnect) waited forever.
+#[tokio::test]
+async fn close_returns_when_writer_dies_before_flushing_it() {
+    let app_manager = Arc::new(MemoryAppManager::new());
+    app_manager.create_app(make_app()).await.unwrap();
+    let adapter = Arc::new(LocalAdapter::new());
+    adapter.init().await;
+    let (socket_id, client) = add_v1_socket(&adapter, &app_manager).await;
+    let conn = adapter.get_connection(&socket_id, APP_ID).await.unwrap();
+
+    // The client never reads: fill the socket buffers until the writer is stuck in a write.
+    {
+        let ws = conn.inner.lock().await;
+        for _ in 0..400 {
+            ws.send_text("x".repeat(64 * 1024)).unwrap();
+        }
+    }
+    let closing = {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            let mut ws = conn.inner.lock().await;
+            ws.close(4201, "Pong reply not received in time".to_string())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !closing.is_finished(),
+        "close() must be waiting behind the stuck writer"
+    );
+
+    drop(client);
+
+    let closed = tokio::time::timeout(Duration::from_secs(5), closing)
+        .await
+        .expect("close() must return once the writer is gone")
+        .unwrap();
+    assert!(
+        matches!(closed, Err(sockudo_core::error::Error::ConnectionClosed(_))),
+        "close() must report the unflushed close frame, got {closed:?}"
+    );
+    let _guard = tokio::time::timeout(Duration::from_secs(1), conn.inner.lock())
+        .await
+        .expect("connection lock must be free again");
+    assert!(conn.cancellation_token().is_cancelled());
+}
